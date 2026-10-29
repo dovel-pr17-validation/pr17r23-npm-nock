@@ -1,0 +1,206 @@
+import path from 'node:path'
+import { expect } from 'chai'
+import sinon from 'sinon'
+import { Interceptor } from '../../lib/interceptor.ts'
+import nock from '../../index.ts'
+import got from './got_client.js'
+
+it('scope exposes interceptors', () => {
+  const scopes = nock.load(
+    path.join(import.meta.dirname, '..', 'fixtures', 'good_request.json'),
+  )
+
+  expect(scopes).to.be.an.instanceOf(Array)
+  expect(scopes).to.have.lengthOf.at.least(1)
+
+  scopes.forEach(scope => {
+    scope.interceptors.forEach(interceptor => {
+      expect(interceptor).to.be.an.instanceOf(Interceptor)
+      interceptor.delay(100)
+    })
+  })
+})
+
+describe('`Scope#constructor`', () => {
+  it('accepts a WHATWG URL instance', async () => {
+    const scope = nock(new URL('http://example.test')).get('/').reply()
+
+    const { statusCode } = await got('http://example.test')
+    expect(statusCode).to.equal(200)
+    scope.done()
+  })
+
+  it('throws on invalid or omitted protocol', async () => {
+    expect(() => nock('ws://example.test')).to.throw()
+    expect(() => nock('localhost/foo')).to.throw()
+    expect(() => nock('foo.com:1234')).to.throw()
+  })
+
+  it('throws on invalid URL format', async () => {
+    expect(() => nock(['This is not a url'])).to.throw()
+  })
+})
+
+describe('`Scope#remove()`', () => {
+  it('removes an active mock', () => {
+    const scope = nock('http://example.test').get('/').reply(200)
+    const key = 'GET http://example.test:80/'
+
+    // Confidence check.
+    expect(scope.activeMocks()).to.deep.equal([key])
+
+    // Act.
+    scope.remove(key, scope.interceptors[0])
+
+    // Assert.
+    expect(scope.activeMocks()).to.deep.equal([])
+  })
+
+  it('when a mock is persisted, does nothing', () => {
+    const scope = nock('http://example.test').persist().get('/').reply(200)
+    const key = 'GET http://example.test:80/'
+
+    // Confidence check.
+    expect(scope.activeMocks()).to.deep.equal([key])
+
+    // Act.
+    scope.remove(key, scope.interceptors[0])
+
+    // Assert.
+    expect(scope.activeMocks()).to.deep.equal([key])
+  })
+
+  it('when the key is nonexistent, does nothing', () => {
+    const scope = nock('http://example.test').get('/').reply(200)
+    const key = 'GET http://example.test:80/'
+
+    // Confidence check.
+    expect(scope.activeMocks()).to.deep.equal([key])
+
+    // Act.
+    scope.remove('GET http://bogus.test:80/', scope.interceptors[0])
+
+    // Assert.
+    expect(scope.activeMocks()).to.deep.equal([key])
+  })
+})
+
+describe('`Scope#isDone()`', () => {
+  it('returns false while a mock is pending, and true after it is consumed', async () => {
+    const scope = nock('http://example.test').get('/').reply()
+
+    expect(scope.isDone()).to.be.false()
+
+    await got('http://example.test/')
+
+    expect(scope.isDone()).to.be.true()
+
+    scope.done()
+  })
+})
+
+describe('`filteringPath()`', function () {
+  it('filter path with function', async function () {
+    const scope = nock('http://example.test')
+      .filteringPath(() => '/?a=2&b=1')
+      .get('/?a=2&b=1')
+      .reply()
+
+    const { statusCode } = await got('http://example.test/', {
+      searchParams: { a: '1', b: '2' },
+    })
+
+    expect(statusCode).to.equal(200)
+    scope.done()
+  })
+
+  it('filter path with regexp', async () => {
+    const scope = nock('http://example.test')
+      .filteringPath(/\d/g, '3')
+      .get('/?a=3&b=3')
+      .reply()
+
+    const { statusCode } = await got('http://example.test/', {
+      searchParams: { a: '1', b: '2' },
+    })
+
+    expect(statusCode).to.equal(200)
+    scope.done()
+  })
+
+  it('filteringPath with invalid argument throws expected', () => {
+    expect(() => nock('http://example.test').filteringPath('abc123')).to.throw(
+      Error,
+      'Invalid arguments: filtering path should be a function or a regular expression',
+    )
+  })
+})
+
+describe('filteringRequestBody()', () => {
+  it('filter body with function', async () => {
+    const onFilteringRequestBody = sinon.spy()
+
+    const scope = nock('http://example.test')
+      .filteringRequestBody(body => {
+        onFilteringRequestBody()
+        expect(body).to.equal('mamma mia')
+        return 'mamma tua'
+      })
+      .post('/', 'mamma tua')
+      .reply()
+
+    const { statusCode } = await got.post('http://example.test/', {
+      body: 'mamma mia',
+    })
+
+    expect(statusCode).to.equal(200)
+    expect(onFilteringRequestBody).to.have.been.calledOnce()
+    scope.done()
+  })
+
+  it('filter body with regexp', async () => {
+    const scope = nock('http://example.test')
+      .filteringRequestBody(/mia/, 'nostra')
+      .post('/', 'mamma nostra')
+      .reply(200, 'Hello World!')
+
+    const { statusCode } = await got.post('http://example.test/', {
+      body: 'mamma mia',
+    })
+
+    expect(statusCode).to.equal(200)
+    scope.done()
+  })
+
+  it('filteringRequestBody with invalid argument throws expected', () => {
+    expect(() =>
+      nock('http://example.test').filteringRequestBody('abc123'),
+    ).to.throw(
+      Error,
+      'Invalid arguments: filtering request body should be a function or a regular expression',
+    )
+  })
+
+  describe('`Scope#clone()`', () => {
+    it('creates a new Scope with the same basePath and scope options', () => {
+      const scope = nock('http://example.test', { encodedQueryParams: true })
+      const clonedScope = scope.clone()
+
+      expect(clonedScope.basePath).to.equal(scope.basePath)
+      expect(clonedScope.scopeOptions).to.deep.equal(scope.scopeOptions)
+    })
+
+    it('creates a new Scope that works independently', async () => {
+      const scope = nock('http://example.test')
+
+      const getScope = scope.get('/').reply(200)
+      const postScope = scope.clone().post('/').reply(200)
+
+      await got('http://example.test/')
+      expect(getScope.isDone()).to.be.true()
+
+      await got.post('http://example.test/')
+      expect(postScope.isDone()).to.be.true()
+    })
+  })
+})

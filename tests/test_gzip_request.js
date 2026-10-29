@@ -1,0 +1,107 @@
+import { expect } from 'chai'
+import http from 'node:http'
+import zlib from 'node:zlib'
+import nock from '../index.ts'
+
+it('should accept and decode gzip encoded application/json', done => {
+  const message = {
+    my: 'contents',
+  }
+
+  nock('http://example.test')
+    .post('/')
+    .reply(async request => {
+      expect(await request.json()).to.deep.equal(message)
+      done()
+      return [200]
+    })
+
+  const req = http.request({
+    hostname: 'example.test',
+    path: '/',
+    method: 'POST',
+    headers: {
+      'content-encoding': 'gzip',
+      'content-type': 'application/json',
+    },
+  })
+
+  const compressedMessage = zlib.gzipSync(JSON.stringify(message))
+  req.write(compressedMessage)
+  req.end()
+})
+
+it('should accept and decode gzip encoded application/json, when headers come from a client as an array', done => {
+  const message = {
+    my: 'contents',
+  }
+
+  const scope = nock('http://example.test').post('/', message).reply(200)
+
+  const req = http.request({
+    hostname: 'example.test',
+    path: '/',
+    method: 'POST',
+    headers: {
+      'content-encoding': ['gzip'],
+      'content-type': ['application/json'],
+    },
+  })
+  req.on('response', () => {
+    scope.done()
+    done()
+  })
+
+  const compressedMessage = zlib.gzipSync(JSON.stringify(message))
+  req.write(compressedMessage)
+  req.end()
+})
+
+it('should not attempt to decode an empty request body with gzip content-encoding', done => {
+  const scope = nock('http://example.test').post('/').reply(200)
+
+  const req = http.request({
+    hostname: 'example.test',
+    path: '/',
+    method: 'POST',
+    headers: {
+      'content-encoding': 'gzip',
+    },
+  })
+
+  req.on('response', res => {
+    expect(res.statusCode).to.equal(200)
+    scope.done()
+    done()
+  })
+  req.end()
+})
+
+it('should accept and decode deflate encoded application/json', done => {
+  const message = {
+    my: 'contents',
+  }
+
+  nock('http://example.test')
+    .post('/')
+    .reply(async request => {
+      expect(await request.json()).to.deep.equal(message)
+      done()
+      return [200]
+    })
+
+  const req = http.request({
+    hostname: 'example.test',
+    path: '/',
+    method: 'POST',
+    headers: {
+      'content-encoding': 'deflate',
+      'content-type': 'application/json',
+    },
+  })
+
+  const compressedMessage = zlib.deflateSync(JSON.stringify(message))
+
+  req.write(compressedMessage)
+  req.end()
+})

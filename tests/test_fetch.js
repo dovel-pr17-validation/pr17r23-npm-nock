@@ -1,0 +1,670 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import zlib from 'node:zlib'
+import { expect } from 'chai'
+import nock from '../index.ts'
+import assertRejects from 'assert-rejects'
+import { startHttpServer } from './servers/index.js'
+import rimraf from 'rimraf'
+import { Readable } from 'node:stream'
+
+describe('Native Fetch', () => {
+  it('input is string', async () => {
+    const scope = nock('http://example.test').get('/').reply()
+
+    const { status } = await fetch('http://example.test/')
+    expect(status).to.equal(200)
+    scope.done()
+  })
+
+  it('input is URL', async () => {
+    const scope = nock('http://example.test').get('/').reply()
+    const { status } = await fetch(new URL('http://example.test/'))
+    expect(status).to.equal(200)
+    scope.done()
+  })
+
+  it('input is Request object', async () => {
+    const scope = nock('http://example.test').get('/').reply()
+
+    const { status } = await fetch(new Request('http://example.test/'))
+    expect(status).to.equal(200)
+    scope.done()
+  })
+
+  it('filter by body', async () => {
+    const scope = nock('http://example.test')
+      .post('/', { test: 'fetch' })
+      .reply()
+
+    const { status } = await fetch('http://example.test/', {
+      method: 'POST',
+      body: JSON.stringify({ test: 'fetch' }),
+    })
+    expect(status).to.equal(200)
+    scope.done()
+  })
+
+  it('filter by request body', async () => {
+    const scope = nock('http://example.test')
+      .post('/', { test: 'fetch' })
+      .reply()
+
+    const { status } = await fetch(
+      new Request('http://example.test/', {
+        method: 'POST',
+        body: JSON.stringify({ test: 'fetch' }),
+      }),
+    )
+    expect(status).to.equal(200)
+    scope.done()
+  })
+
+  it('no match', async () => {
+    nock('http://example.test').get('/').reply()
+
+    const response = await fetch('http://example.test/wrong-path')
+    expect(response.status).to.equal(501)
+    expect((await response.json()).code).to.equal('ERR_NOCK_NO_MATCH')
+  })
+
+  it('forward request if no mock', async () => {
+    const { origin } = await startHttpServer((request, response) => {
+      response.write('live')
+      response.end()
+    })
+
+    const { status } = await fetch(origin)
+    expect(status).to.equal(200)
+  })
+
+  it('should work with empty response', async () => {
+    nock('http://example.test').get('/').reply(204)
+
+    const { status } = await fetch('http://example.test')
+    expect(status).to.equal(204)
+  })
+
+  it('should work https', async () => {
+    nock('https://example.test').get('/').reply()
+
+    const { status } = await fetch('https://example.test')
+    expect(status).to.equal(200)
+  })
+
+  it('should set the statusText according to the response code', async () => {
+    nock('https://example.test').get('/').reply(404)
+
+    const { status, statusText } = await fetch('https://example.test')
+    expect(status).to.equal(404)
+    expect(statusText).to.equal('Not Found')
+  })
+
+  it('should return mocked response', async () => {
+    const message = 'Lorem ipsum dolor sit amet'
+    const scope = nock('http://example.test').get('/foo').reply(200, message)
+
+    const response = await fetch('http://example.test/foo')
+
+    expect(response.status).to.equal(200)
+    expect(await response.text()).to.equal(message)
+    scope.done()
+  })
+
+  it('should support body cancellation', async () => {
+    const scope = nock('http://test').post('/').reply(200)
+
+    const response = await fetch('http://test', { method: 'POST' })
+    await response.body.cancel()
+    scope.done()
+  })
+
+  it('should abort a request with a timeout signal', async () => {
+    let timer
+    const scope = nock('http://test.com')
+      .get('/')
+      .reply(200, async () => {
+        await new Promise(resolve => (timer = setTimeout(resolve, 100)))
+        return true
+      })
+
+    const response = fetch('http://test.com', {
+      signal: AbortSignal.timeout(50),
+    })
+    await assertRejects(
+      response,
+      'TimeoutError: The operation was aborted due to timeout',
+    )
+    scope.done()
+    clearTimeout(timer)
+  })
+
+  // https://github.com/nock/nock/issues/2768
+  it('should not mess the Headers object', async () => {
+    nock('https://api.test.com', {
+      reqheaders: { 'Content-Type': 'application/json' },
+    })
+      .get('/data')
+      .times(2)
+      .reply(200)
+
+    const headers = new Headers({ 'Content-Type': 'application/json' })
+
+    await fetch('https://api.test.com/data', { headers })
+    await fetch('https://api.test.com/data', { headers })
+  })
+
+  // https://github.com/nock/nock/issues/2780
+  it('should not mess the Headers object', async () => {
+    nock('https://api.test.com', {
+      reqheaders: { 'Content-Type': 'application/json' },
+    })
+      .get('/data')
+      .times(2)
+      .reply(200)
+
+    const headers = new Headers({ 'Content-Type': 'application/json' })
+
+    await fetch('https://api.test.com/data', { headers })
+    await fetch('https://api.test.com/data', { headers })
+  })
+
+  it('should return a url for cloned response URL ', async () => {
+    const scope = nock('http://example.test').get('/').reply()
+
+    const response = await fetch(new URL('http://example.test/'))
+    expect(response.clone().url).to.equal('http://example.test/')
+    scope.done()
+  })
+
+  describe('content-encoding', () => {
+    it('should accept gzipped content', async () => {
+      const message = 'Lorem ipsum dolor sit amet'
+      const compressed = zlib.gzipSync(message)
+
+      const scope = nock('http://example.test')
+        .get('/foo')
+        .reply(200, compressed, {
+          'Content-Length': String(compressed.length),
+          'Content-Encoding': 'gzip',
+        })
+      const response = await fetch('http://example.test/foo')
+
+      expect(response.status).to.equal(200)
+      expect(await response.text()).to.equal(message)
+      scope.done()
+    })
+
+    it('should accept deflated content', async () => {
+      const message = 'Lorem ipsum dolor sit amet'
+      const compressed = zlib.deflateSync(message)
+
+      const scope = nock('http://example.test')
+        .get('/foo')
+        .reply(200, compressed, {
+          'Content-Length': String(compressed.length),
+          'Content-Encoding': 'deflate',
+        })
+      const response = await fetch('http://example.test/foo')
+
+      expect(response.status).to.equal(200)
+      expect(await response.text()).to.equal(message)
+      scope.done()
+    })
+
+    it('should accept brotli content', async () => {
+      const message = 'Lorem ipsum dolor sit amet'
+      const compressed = zlib.brotliCompressSync(message)
+
+      const scope = nock('http://example.test')
+        .get('/foo')
+        .reply(200, compressed, {
+          'Content-Length': String(compressed.length),
+          'Content-Encoding': 'br',
+        })
+      const response = await fetch('http://example.test/foo')
+
+      expect(response.status).to.equal(200)
+      expect(await response.text()).to.equal(message)
+      scope.done()
+    })
+
+    it('should accept gzip and brotli content', async () => {
+      const message = 'Lorem ipsum dolor sit amet'
+      const compressed = zlib.brotliCompressSync(zlib.gzipSync(message))
+
+      const scope = nock('http://example.test')
+        .get('/foo')
+        .reply(200, compressed, {
+          'Content-Length': String(compressed.length),
+          'Content-Encoding': 'gzip, br',
+        })
+      const response = await fetch('http://example.test/foo')
+
+      expect(response.status).to.equal(200)
+      expect(await response.text()).to.equal(message)
+      scope.done()
+    })
+
+    it('should accept gzip and deflate content', async () => {
+      const message = 'Lorem ipsum dolor sit amet'
+      const compressed = zlib.deflateSync(zlib.gzipSync(message))
+
+      const scope = nock('http://example.test')
+        .get('/foo')
+        .reply(200, compressed, {
+          'Content-Length': String(compressed.length),
+          'Content-Encoding': 'gzip, deflate',
+        })
+      const response = await fetch('http://example.test/foo')
+
+      expect(response.status).to.equal(200)
+      expect(await response.text()).to.equal(message)
+      scope.done()
+    })
+
+    it('should pass through the result if a not supported encoding was used', async () => {
+      const message = 'Lorem ipsum dolor sit amet'
+      const compressed = Buffer.from(message)
+      const scope = nock('http://example.test')
+        .get('/foo')
+        .reply(200, compressed, {
+          'Content-Length': String(compressed.length),
+          'Content-Encoding': 'invalid',
+        })
+      const response = await fetch('http://example.test/foo')
+      expect(response.status).to.equal(200)
+      expect(await response.text()).to.equal(message)
+      scope.done()
+    })
+
+    // TODO: fix @mswjs/interceptors - push after error in the stream
+    it.skip('should throw error if wrong encoding is used', async () => {
+      const message = 'Lorem ipsum dolor sit amet'
+      const compressed = zlib.gzipSync(message)
+
+      const scope = nock('http://example.test')
+        .get('/foo')
+        .reply(200, compressed, {
+          'Content-Length': String(message.length),
+          'Content-Encoding': 'br',
+        })
+      const response = await fetch('http://example.test/foo')
+      await response
+        .text()
+        .then(() => {
+          throw new Error('Should have thrown')
+        })
+        .catch(e => {
+          expect(e.message).to.contain('Decompression failed')
+          scope.done()
+        })
+    })
+
+    // May be a bug in Node.js which swallows the error. Need to investigate it further
+    it.skip('should throw error if encoding is used with uncompressed body', async () => {
+      const message = 'Lorem ipsum dolor sit amet'
+
+      const scope = nock('http://example.test')
+        .get('/foo')
+        .reply(200, Buffer.from(message), {
+          'Content-Length': String(message.length),
+          'Content-Encoding': 'br',
+        })
+      const response = await fetch('http://example.test/foo')
+      await response
+        .text()
+        .then(() => {
+          throw new Error('Should have thrown')
+        })
+        .catch(e => {
+          expect(e.message).to.contain('Decompression failed')
+          scope.done()
+        })
+    })
+  })
+
+  describe('redirect', () => {
+    let origin
+
+    beforeEach(async () => {
+      const server = await startHttpServer((request, response) => {
+        if (request.url === '/redirected') {
+          response.writeHead(200).end('redirected')
+        } else {
+          response.writeHead(302, { Location: '/redirected' }).end()
+        }
+      })
+
+      origin = server.origin
+    })
+
+    it('should follow a bypassed redirect response', async () => {
+      const response = await fetch(origin)
+      expect(response.status).to.eq(200)
+      expect(await response.text()).to.eq('redirected')
+    })
+
+    it('should follows a mocked redirect to the original server', async () => {
+      nock(origin, { allowUnmocked: true })
+        .get('/')
+        .reply(302, '', { Location: `${origin}/redirected` })
+
+      const response = await fetch(origin)
+      expect(response.status).to.eq(200)
+      expect(await response.text()).to.eq('redirected')
+    })
+
+    it('should follows a mocked relative redirect to the original server', async () => {
+      nock(origin, { allowUnmocked: true })
+        .get('/')
+        .reply(302, '', { Location: `/redirected` })
+
+      const response = await fetch(origin)
+      expect(response.status).to.eq(200)
+      expect(await response.text()).to.eq('redirected')
+    })
+
+    it('should follows a mocked redirect to a mocked response', async () => {
+      nock(origin)
+        .get('/')
+        .reply(302, '', { Location: `${origin}/redirected` })
+      nock(origin).get('/redirected').reply(200, 'mocked')
+
+      const response = await fetch(origin)
+      expect(response.status).to.eq(200)
+      expect(await response.text()).to.eq('mocked')
+    })
+
+    it('should returns the redirect response as-is for a request with "manual" redirect mode', async () => {
+      nock(origin)
+        .get('/')
+        .reply(302, '', { Location: `${origin}/redirected` })
+
+      const response = await fetch(origin, { redirect: 'manual' })
+      expect(response.status).to.eq(302)
+      expect(response.headers.get('location')).to.eq(`${origin}/redirected`)
+    })
+
+    it('should throws a network error on a redirect for a request with "error" redirect mode', async () => {
+      nock(origin)
+        .get('/')
+        .reply(302, '', { Location: `${origin}/redirected` })
+
+      await assertRejects(fetch(origin, { redirect: 'error' }), /fetch failed/)
+    })
+
+    it('should throws a network error on a non-303 redirect with a body', async () => {
+      nock(origin)
+        .put('/')
+        .reply(302, '', { Location: `${origin}/redirected` })
+
+      await assertRejects(
+        fetch(origin, {
+          method: 'PUT',
+          body: Readable.from('hello'),
+          duplex: 'half',
+        }),
+        /fetch failed/,
+      )
+    })
+
+    it('should throws a network error on redirects to a non-HTTP scheme', async () => {
+      nock(origin).get('/').reply(302, '', { Location: `wss://localhost` })
+
+      await assertRejects(fetch(origin), /fetch failed/)
+    })
+
+    it('should throws on a redirect with credentials for a "cors" request', async () => {
+      nock(origin)
+        .get('/')
+        .reply(302, '', { Location: `http://user:password@localhost` })
+
+      await assertRejects(fetch(origin, { mode: 'cors' }), /fetch failed/)
+    })
+
+    it('should coerces a 301/302 redirect for a POST request to a GET request', async () => {
+      let body, headers
+      nock(origin)
+        .post('/')
+        .reply(302, '', { Location: `${origin}/redirected` })
+      nock(origin)
+        .get('/redirected')
+        .reply(200, async request => {
+          body = await request.text()
+          headers = Object.fromEntries(request.headers.entries())
+        })
+
+      const response = await fetch(origin, {
+        method: 'POST',
+        headers: {
+          'content-language': 'en-US',
+          'content-location': 'http://localhost/redirected',
+          'content-type': 'application/json',
+          'content-length': '0',
+          'x-other-header': 'value',
+        },
+      })
+
+      expect(response.status).to.eq(200)
+      // Must remove body-related request headers.
+      expect(headers).to.includes({ 'x-other-header': 'value' })
+      expect(Object.keys(headers)).to.not.includes([
+        'content-language',
+        'content-location',
+        'content-type',
+        'content-length',
+      ])
+      // Non-GET/HEAD request body of a 303 redirect must be null.
+      expect(body).to.be.empty()
+    })
+
+    it('should coerces a 303 redirect to a non-HEAD/GET request to a GET request', async () => {
+      let body, headers
+      nock(origin)
+        .post('/')
+        .reply(303, '', { Location: `${origin}/redirected` })
+      nock(origin)
+        .get('/redirected')
+        .reply(200, async request => {
+          body = await request.text()
+          headers = Object.fromEntries(request.headers.entries())
+        })
+
+      const response = await fetch(origin, {
+        method: 'POST',
+        headers: {
+          'content-language': 'en-US',
+          'content-location': 'http://localhost/redirected',
+          'content-type': 'application/json',
+          'content-length': '0',
+          'x-other-header': 'value',
+        },
+      })
+
+      expect(response.status).to.eq(200)
+      // Must remove body-related request headers.
+      expect(headers).to.includes({ 'x-other-header': 'value' })
+      expect(Object.keys(headers)).to.not.includes([
+        'content-language',
+        'content-location',
+        'content-type',
+        'content-length',
+      ])
+      // Non-GET/HEAD request body of a 303 redirect must be null.
+      expect(body).to.be.empty()
+    })
+
+    it('should deletes sensitive request headers for a cross-origin redirect', async () => {
+      let body, headers
+      nock(origin)
+        .get('/')
+        .reply(303, '', { Location: `https://anotherhost.com/redirected` })
+      nock('https://anotherhost.com')
+        .get('/redirected')
+        .reply(200, async request => {
+          body = await request.text()
+          headers = Object.fromEntries(request.headers.entries())
+        })
+
+      const response = await fetch(origin, {
+        headers: {
+          authorization: 'Bearer TOKEN',
+          'proxy-authorization': 'Bearer PROXY_TOKEN',
+          cookie: 'a=1',
+          host: 'localhost',
+          'x-other-header': 'value',
+        },
+      })
+
+      expect(response.status).to.eq(200)
+      expect(headers).to.includes({ 'x-other-header': 'value' })
+      expect(Object.keys(headers)).to.not.includes([
+        'authorization',
+        'proxy-authorization',
+        'cookie',
+        'host',
+      ])
+      expect(body).to.be.empty()
+    })
+  })
+
+  describe('recording', () => {
+    it('records and replays gzipped nocks correctly', async () => {
+      const exampleText = '<html><body>example</body></html>'
+
+      const { origin } = await startHttpServer((request, response) => {
+        const body = zlib.brotliCompressSync(zlib.gzipSync(exampleText))
+
+        response.writeHead(200, { 'content-encoding': 'gzip, br' })
+        response.end(body)
+      })
+
+      nock.restore()
+      nock.recorder.clear()
+      expect(nock.recorder.play()).to.be.empty()
+
+      nock.recorder.rec({
+        dont_print: true,
+        output_objects: true,
+      })
+
+      const response = await fetch(origin)
+      expect(await response.text()).to.equal(exampleText)
+      expect(response.headers.get('content-encoding')).to.equal('gzip, br')
+
+      nock.restore()
+      const recorded = nock.recorder.play()
+      nock.recorder.clear()
+      nock.activate()
+
+      expect(recorded).to.have.lengthOf(1)
+      const nocks = nock.define(recorded)
+
+      const replayedResponse = await fetch(origin)
+      expect(await replayedResponse.text()).to.equal(exampleText)
+      expect(replayedResponse.headers.get('content-encoding')).to.equal(
+        'gzip, br',
+      )
+
+      nocks.forEach(nock => nock.done())
+    })
+
+    it('records and replays deflated nocks correctly', async () => {
+      const exampleText = '<html><body>example</body></html>'
+
+      const { origin } = await startHttpServer((request, response) => {
+        const body = zlib.deflateSync(exampleText)
+
+        response.writeHead(200, { 'content-encoding': 'deflate' })
+        response.end(body)
+      })
+
+      nock.restore()
+      nock.recorder.clear()
+      expect(nock.recorder.play()).to.be.empty()
+
+      nock.recorder.rec({
+        dont_print: true,
+        output_objects: true,
+      })
+
+      const response = await fetch(origin)
+      expect(await response.text()).to.equal(exampleText)
+      expect(response.headers.get('content-encoding')).to.equal('deflate')
+
+      nock.restore()
+      const recorded = nock.recorder.play()
+      nock.recorder.clear()
+      nock.activate()
+
+      expect(recorded).to.have.lengthOf(1)
+      const nocks = nock.define(recorded)
+
+      const replayedResponse = await fetch(origin)
+      expect(await replayedResponse.text()).to.equal(exampleText)
+      expect(replayedResponse.headers.get('content-encoding')).to.equal(
+        'deflate',
+      )
+
+      nocks.forEach(nock => nock.done())
+    })
+  })
+
+  describe('Nock Back', () => {
+    beforeEach(() => {
+      nock.back.fixtures = path.resolve(import.meta.dirname, 'fixtures')
+    })
+
+    describe('update mode', () => {
+      let fixture
+      let fixtureLoc
+
+      beforeEach(() => {
+        // random fixture file so tests don't interfere with each other
+        const token = crypto.randomBytes(4).toString('hex')
+        fixture = `temp_${token}.json`
+        fixtureLoc = path.resolve(import.meta.dirname, 'fixtures', fixture)
+        nock.back.setMode('update')
+      })
+
+      after(() => {
+        rimraf.sync(
+          path.resolve(import.meta.dirname, 'fixtures', 'temp_*.json'),
+        )
+        nock.back.setMode('dryrun')
+      })
+
+      // TODO: we don't wait for the response promise in interceptors.
+      it('should record fetch POST request', async () => {
+        expect(fs.existsSync(fixtureLoc)).to.be.false()
+
+        const { nockDone } = await nock.back(fixture)
+        const { origin } = await startHttpServer((request, response) => {
+          response.write('live')
+          response.end()
+        })
+
+        const { status } = await fetch(origin, {
+          method: 'POST',
+          body: 'Hello, world!',
+        })
+
+        nockDone()
+        expect(status).to.equal(200)
+        const fixtureContent = JSON.parse(
+          fs.readFileSync(fixtureLoc).toString('utf8'),
+        )
+        expect(fixtureContent).to.have.length(1)
+
+        const [firstFixture] = fixtureContent
+        expect(firstFixture).to.include({
+          method: 'POST',
+          path: '/',
+          status: 200,
+        })
+      })
+    })
+  })
+})
